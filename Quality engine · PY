@@ -1,0 +1,181 @@
+"""
+src/quality_engine.py
+Real-time data quality engine using Great Expectations + Data Contracts
+Mirrors HIPAA-compliant pipeline validation at McKesson
+"""
+import great_expectations as gx
+import pandas as pd
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Dict, Any
+from datetime import datetime
+import json
+
+
+@dataclass
+class DataContract:
+    """
+    Data Contract definition — defines schema, quality rules,
+    and SLA expectations for a dataset
+    """
+    name: str
+    version: str
+    owner: str
+    consumers: List[str]
+    schema: Dict[str, str]
+    quality_rules: Dict[str, Any]
+    sla_freshness_hours: int = 1
+
+
+# Example: Clinical documents data contract
+CLINICAL_DOCS_CONTRACT = DataContract(
+    name="clinical_documents_v1",
+    version="1.0.0",
+    owner="data-engineering@mckesson.com",
+    consumers=["ml-team", "analytics", "reporting"],
+    schema={
+        "document_id": "str",
+        "patient_id": "str",
+        "document_type": "str",
+        "content": "str",
+        "created_at": "datetime",
+        "is_processed": "bool",
+    },
+    quality_rules={
+        "document_id_not_null": True,
+        "patient_id_not_null": True,
+        "document_type_values": ["clinical_note", "lab_report", "prescription", "discharge_summary"],
+        "content_min_length": 10,
+        "max_null_percentage": 0.01,
+    },
+    sla_freshness_hours=1
+)
+
+
+def generate_clinical_data(n: int = 1000, inject_issues: bool = False) -> pd.DataFrame:
+    """Generate synthetic clinical document data"""
+    np.random.seed(42)
+    doc_types = ["clinical_note", "lab_report", "prescription", "discharge_summary"]
+
+    df = pd.DataFrame({
+        "document_id": [f"DOC_{i:06d}" for i in range(n)],
+        "patient_id": [f"PAT_{np.random.randint(1000, 9999)}" for _ in range(n)],
+        "document_type": np.random.choice(doc_types, n),
+        "content": [f"Clinical content sample {i} with sufficient length for validation" for i in range(n)],
+        "created_at": pd.date_range("2024-01-01", periods=n, freq="1min"),
+        "is_processed": np.random.choice([True, False], n),
+    })
+
+    if inject_issues:
+        # Inject nulls
+        null_idx = np.random.choice(n, size=int(n * 0.05), replace=False)
+        df.loc[null_idx, "patient_id"] = None
+
+        # Inject invalid document types
+        bad_idx = np.random.choice(n, size=int(n * 0.02), replace=False)
+        df.loc[bad_idx, "document_type"] = "INVALID_TYPE"
+
+    return df
+
+
+def validate_against_contract(
+    df: pd.DataFrame,
+    contract: DataContract,
+    run_id: str = None
+) -> Dict[str, Any]:
+    """
+    Validate a dataframe against a Data Contract
+    Returns validation summary with pass/fail per rule
+    """
+    if run_id is None:
+        run_id = f"validation_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+
+    results = {
+        "run_id": run_id,
+        "contract": contract.name,
+        "timestamp": datetime.utcnow().isoformat(),
+        "total_records": len(df),
+        "rules": {},
+        "passed": True,
+        "quality_score": 0.0,
+    }
+
+    rules_passed = 0
+    total_rules = 0
+
+    # Rule 1: Not null checks
+    for col, required in [("document_id", True), ("patient_id", True)]:
+        total_rules += 1
+        null_count = df[col].isnull().sum()
+        null_pct = null_count / len(df)
+        passed = null_pct <= contract.quality_rules["max_null_percentage"]
+        results["rules"][f"{col}_not_null"] = {
+            "passed": passed,
+            "null_count": int(null_count),
+            "null_percentage": round(null_pct * 100, 2),
+        }
+        if passed:
+            rules_passed += 1
+        else:
+            results["passed"] = False
+
+    # Rule 2: Valid document types
+    total_rules += 1
+    valid_types = set(contract.quality_rules["document_type_values"])
+    invalid_count = (~df["document_type"].isin(valid_types)).sum()
+    passed = invalid_count == 0
+    results["rules"]["document_type_valid"] = {
+        "passed": passed,
+        "invalid_count": int(invalid_count),
+        "valid_types": list(valid_types),
+    }
+    if passed:
+        rules_passed += 1
+    else:
+        results["passed"] = False
+
+    # Rule 3: Content minimum length
+    total_rules += 1
+    min_len = contract.quality_rules["content_min_length"]
+    short_count = (df["content"].str.len() < min_len).sum()
+    passed = short_count == 0
+    results["rules"]["content_min_length"] = {
+        "passed": passed,
+        "violations": int(short_count),
+        "min_required": min_len,
+    }
+    if passed:
+        rules_passed += 1
+
+    # Rule 4: Schema check
+    total_rules += 1
+    missing_cols = [c for c in contract.schema.keys() if c not in df.columns]
+    passed = len(missing_cols) == 0
+    results["rules"]["schema_check"] = {
+        "passed": passed,
+        "missing_columns": missing_cols,
+    }
+    if passed:
+        rules_passed += 1
+    else:
+        results["passed"] = False
+
+    # Quality score
+    results["quality_score"] = round((rules_passed / total_rules) * 100, 1)
+
+    status = "✅ PASSED" if results["passed"] else "❌ FAILED"
+    print(f"{status} | Quality Score: {results['quality_score']}% | {run_id}")
+
+    return results
+
+
+if __name__ == "__main__":
+    print("=== Clean Data Validation ===")
+    clean_df = generate_clinical_data(1000, inject_issues=False)
+    clean_results = validate_against_contract(clean_df, CLINICAL_DOCS_CONTRACT)
+    print(json.dumps(clean_results["rules"], indent=2))
+
+    print("\n=== Data with Quality Issues ===")
+    dirty_df = generate_clinical_data(1000, inject_issues=True)
+    dirty_results = validate_against_contract(dirty_df, CLINICAL_DOCS_CONTRACT)
+    print(json.dumps(dirty_results["rules"], indent=2))
